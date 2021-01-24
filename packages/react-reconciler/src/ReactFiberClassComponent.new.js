@@ -8,11 +8,11 @@
  */
 
 import type {Fiber} from './ReactInternalTypes';
-import type {Lanes} from './ReactFiberLane';
+import type {Lanes} from './ReactFiberLane.new';
 import type {UpdateQueue} from './ReactUpdateQueue.new';
 
 import * as React from 'react';
-import {Update, Snapshot, MountLayoutDev} from './ReactFiberFlags';
+import {MountLayoutDev, Update, Snapshot} from './ReactFiberFlags';
 import {
   debugRenderPhaseSideEffectsForStrictMode,
   disableLegacyContext,
@@ -49,7 +49,7 @@ import {
   initializeUpdateQueue,
   cloneUpdateQueue,
 } from './ReactUpdateQueue.new';
-import {NoLanes} from './ReactFiberLane';
+import {NoLanes} from './ReactFiberLane.new';
 import {
   cacheContext,
   getMaskedContext,
@@ -213,7 +213,7 @@ const classComponentUpdater = {
       update.callback = callback;
     }
 
-    enqueueUpdate(fiber, update);
+    enqueueUpdate(fiber, update, lane);
     scheduleUpdateOnFiber(fiber, lane, eventTime);
 
     if (__DEV__) {
@@ -245,7 +245,7 @@ const classComponentUpdater = {
       update.callback = callback;
     }
 
-    enqueueUpdate(fiber, update);
+    enqueueUpdate(fiber, update, lane);
     scheduleUpdateOnFiber(fiber, lane, eventTime);
 
     if (__DEV__) {
@@ -276,7 +276,7 @@ const classComponentUpdater = {
       update.callback = callback;
     }
 
-    enqueueUpdate(fiber, update);
+    enqueueUpdate(fiber, update, lane);
     scheduleUpdateOnFiber(fiber, lane, eventTime);
 
     if (__DEV__) {
@@ -981,6 +981,7 @@ function resumeMountClassInstance(
         enableDoubleInvokingEffects &&
         (workInProgress.mode & (BlockingMode | ConcurrentMode)) !== NoMode
       ) {
+        // Never double-invoke effects for legacy roots.
         workInProgress.flags |= MountLayoutDev | Update;
       } else {
         workInProgress.flags |= Update;
@@ -1032,6 +1033,7 @@ function resumeMountClassInstance(
         enableDoubleInvokingEffects &&
         (workInProgress.mode & (BlockingMode | ConcurrentMode)) !== NoMode
       ) {
+        // Never double-invoke effects for legacy roots.
         workInProgress.flags |= MountLayoutDev | Update;
       } else {
         workInProgress.flags |= Update;
@@ -1046,6 +1048,7 @@ function resumeMountClassInstance(
         enableDoubleInvokingEffects &&
         (workInProgress.mode & (BlockingMode | ConcurrentMode)) !== NoMode
       ) {
+        // Never double-invoke effects for legacy roots.
         workInProgress.flags |= MountLayoutDev | Update;
       } else {
         workInProgress.flags |= Update;

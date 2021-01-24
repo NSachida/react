@@ -13,23 +13,31 @@ import type {
   MutableSourceSubscribeFn,
   ReactContext,
 } from 'shared/ReactTypes';
-import type {Fiber, Dispatcher} from './ReactInternalTypes';
-import type {Lanes, Lane} from './ReactFiberLane';
+import type {Fiber, Dispatcher, HookType} from './ReactInternalTypes';
+import type {Lanes, Lane} from './ReactFiberLane.old';
 import type {HookFlags} from './ReactHookEffectTags';
 import type {ReactPriorityLevel} from './ReactInternalTypes';
 import type {FiberRoot} from './ReactInternalTypes';
 import type {OpaqueIDType} from './ReactFiberHostConfig';
+import type {Cache} from './ReactFiberCacheComponent.old';
 
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import {
   enableDebugTracing,
   enableSchedulingProfiler,
   enableNewReconciler,
+  enableCache,
   decoupleUpdatePriorityFromScheduler,
   enableUseRefAccessWarning,
+  enableDoubleInvokingEffects,
 } from 'shared/ReactFeatureFlags';
 
-import {NoMode, BlockingMode, DebugTracingMode} from './ReactTypeOfMode';
+import {
+  NoMode,
+  BlockingMode,
+  ConcurrentMode,
+  DebugTracingMode,
+} from './ReactTypeOfMode';
 import {
   NoLane,
   NoLanes,
@@ -43,11 +51,15 @@ import {
   setCurrentUpdateLanePriority,
   higherLanePriority,
   DefaultLanePriority,
-} from './ReactFiberLane';
+} from './ReactFiberLane.old';
 import {readContext} from './ReactFiberNewContext.old';
+import {HostRoot, CacheComponent} from './ReactWorkTags';
 import {
   Update as UpdateEffect,
   Passive as PassiveEffect,
+  PassiveStatic as PassiveStaticEffect,
+  MountLayoutDev as MountLayoutDevEffect,
+  MountPassiveDev as MountPassiveDevEffect,
 } from './ReactFiberFlags';
 import {
   HasEffect as HookHasEffect,
@@ -90,6 +102,8 @@ import {
 import {getIsRendering} from './ReactCurrentFiber';
 import {logStateUpdateScheduled} from './DebugTracing';
 import {markStateUpdateScheduled} from './SchedulingProfiler';
+import {CacheContext} from './ReactFiberCacheComponent.old';
+import {createUpdate, enqueueUpdate} from './ReactUpdateQueue.old';
 
 const {ReactCurrentDispatcher, ReactCurrentBatchConfig} = ReactSharedInternals;
 
@@ -108,22 +122,6 @@ type UpdateQueue<S, A> = {|
   lastRenderedReducer: ((S, A) => S) | null,
   lastRenderedState: S | null,
 |};
-
-export type HookType =
-  | 'useState'
-  | 'useReducer'
-  | 'useContext'
-  | 'useRef'
-  | 'useEffect'
-  | 'useLayoutEffect'
-  | 'useCallback'
-  | 'useMemo'
-  | 'useImperativeHandle'
-  | 'useDebugValue'
-  | 'useDeferredValue'
-  | 'useTransition'
-  | 'useMutableSource'
-  | 'useOpaqueIdentifier';
 
 let didWarnAboutMismatchedHooksForComponent;
 let didWarnAboutUseOpaqueIdentifier;
@@ -482,7 +480,22 @@ export function bailoutHooks(
   lanes: Lanes,
 ) {
   workInProgress.updateQueue = current.updateQueue;
-  workInProgress.flags &= ~(PassiveEffect | UpdateEffect);
+  // TODO: Don't need to reset the flags here, because they're reset in the
+  // complete phase (bubbleProperties).
+  if (
+    __DEV__ &&
+    enableDoubleInvokingEffects &&
+    (workInProgress.mode & (BlockingMode | ConcurrentMode)) !== NoMode
+  ) {
+    workInProgress.flags &= ~(
+      MountPassiveDevEffect |
+      MountLayoutDevEffect |
+      PassiveEffect |
+      UpdateEffect
+    );
+  } else {
+    workInProgress.flags &= ~(PassiveEffect | UpdateEffect);
+  }
   current.lanes = removeLanes(current.lanes, lanes);
 }
 
@@ -1318,12 +1331,25 @@ function mountEffect(
       warnIfNotCurrentlyActingEffectsInDEV(currentlyRenderingFiber);
     }
   }
-  return mountEffectImpl(
-    UpdateEffect | PassiveEffect,
-    HookPassive,
-    create,
-    deps,
-  );
+  if (
+    __DEV__ &&
+    enableDoubleInvokingEffects &&
+    (currentlyRenderingFiber.mode & (BlockingMode | ConcurrentMode)) !== NoMode
+  ) {
+    return mountEffectImpl(
+      MountPassiveDevEffect | PassiveEffect | PassiveStaticEffect,
+      HookPassive,
+      create,
+      deps,
+    );
+  } else {
+    return mountEffectImpl(
+      PassiveEffect | PassiveStaticEffect,
+      HookPassive,
+      create,
+      deps,
+    );
+  }
 }
 
 function updateEffect(
@@ -1336,19 +1362,27 @@ function updateEffect(
       warnIfNotCurrentlyActingEffectsInDEV(currentlyRenderingFiber);
     }
   }
-  return updateEffectImpl(
-    UpdateEffect | PassiveEffect,
-    HookPassive,
-    create,
-    deps,
-  );
+  return updateEffectImpl(PassiveEffect, HookPassive, create, deps);
 }
 
 function mountLayoutEffect(
   create: () => (() => void) | void,
   deps: Array<mixed> | void | null,
 ): void {
-  return mountEffectImpl(UpdateEffect, HookLayout, create, deps);
+  if (
+    __DEV__ &&
+    enableDoubleInvokingEffects &&
+    (currentlyRenderingFiber.mode & (BlockingMode | ConcurrentMode)) !== NoMode
+  ) {
+    return mountEffectImpl(
+      MountLayoutDevEffect | UpdateEffect,
+      HookLayout,
+      create,
+      deps,
+    );
+  } else {
+    return mountEffectImpl(UpdateEffect, HookLayout, create, deps);
+  }
 }
 
 function updateLayoutEffect(
@@ -1407,12 +1441,25 @@ function mountImperativeHandle<T>(
   const effectDeps =
     deps !== null && deps !== undefined ? deps.concat([ref]) : null;
 
-  return mountEffectImpl(
-    UpdateEffect,
-    HookLayout,
-    imperativeHandleEffect.bind(null, create, ref),
-    effectDeps,
-  );
+  if (
+    __DEV__ &&
+    enableDoubleInvokingEffects &&
+    (currentlyRenderingFiber.mode & (BlockingMode | ConcurrentMode)) !== NoMode
+  ) {
+    return mountEffectImpl(
+      MountLayoutDevEffect | UpdateEffect,
+      HookLayout,
+      imperativeHandleEffect.bind(null, create, ref),
+      effectDeps,
+    );
+  } else {
+    return mountEffectImpl(
+      UpdateEffect,
+      HookLayout,
+      imperativeHandleEffect.bind(null, create, ref),
+      effectDeps,
+    );
+  }
 }
 
 function updateImperativeHandle<T>(
@@ -1693,7 +1740,11 @@ function mountOpaqueIdentifier(): OpaqueIDType | void {
     const setId = mountState(id)[1];
 
     if ((currentlyRenderingFiber.mode & BlockingMode) === NoMode) {
-      currentlyRenderingFiber.flags |= UpdateEffect | PassiveEffect;
+      if (__DEV__ && enableDoubleInvokingEffects) {
+        currentlyRenderingFiber.flags |= MountPassiveDevEffect | PassiveEffect;
+      } else {
+        currentlyRenderingFiber.flags |= PassiveEffect;
+      }
       pushEffect(
         HookHasEffect | HookPassive,
         () => {
@@ -1719,6 +1770,55 @@ function updateOpaqueIdentifier(): OpaqueIDType | void {
 function rerenderOpaqueIdentifier(): OpaqueIDType | void {
   const id = rerenderState(undefined)[0];
   return id;
+}
+
+function mountRefresh() {
+  const hook = mountWorkInProgressHook();
+  const refresh = (hook.memoizedState = refreshCache.bind(
+    null,
+    currentlyRenderingFiber,
+  ));
+  return refresh;
+}
+
+function updateRefresh() {
+  const hook = updateWorkInProgressHook();
+  return hook.memoizedState;
+}
+
+function refreshCache<T>(fiber: Fiber, seedKey: ?() => T, seedValue: T) {
+  // TODO: Does Cache work in legacy mode? Should decide and write a test.
+  // TODO: Consider warning if the refresh is at discrete priority, or if we
+  // otherwise suspect that it wasn't batched properly.
+  let provider = fiber.return;
+  while (provider !== null) {
+    switch (provider.tag) {
+      case CacheComponent:
+      case HostRoot: {
+        const lane = requestUpdateLane(provider);
+        const eventTime = requestEventTime();
+        const root = scheduleUpdateOnFiber(provider, lane, eventTime);
+
+        const seededCache = new Map();
+        if (seedKey !== null && seedKey !== undefined && root !== null) {
+          // Seed the cache with the value passed by the caller. This could be
+          // from a server mutation, or it could be a streaming response.
+          seededCache.set(seedKey, seedValue);
+        }
+
+        // Schedule an update on the cache boundary to trigger a refresh.
+        const refreshUpdate = createUpdate(eventTime, lane);
+        const payload = {
+          cache: seededCache,
+        };
+        refreshUpdate.payload = payload;
+        enqueueUpdate(provider, refreshUpdate);
+        return;
+      }
+    }
+    provider = provider.return;
+  }
+  // TODO: Warn if unmounted?
 }
 
 function dispatchAction<S, A>(
@@ -1831,6 +1931,19 @@ function dispatchAction<S, A>(
   }
 }
 
+function getCacheForType<T>(resourceType: () => T): T {
+  if (!enableCache) {
+    invariant(false, 'Not implemented.');
+  }
+  const cache: Cache = readContext(CacheContext);
+  let cacheForType: T | void = (cache.get(resourceType): any);
+  if (cacheForType === undefined) {
+    cacheForType = resourceType();
+    cache.set(resourceType, cacheForType);
+  }
+  return cacheForType;
+}
+
 export const ContextOnlyDispatcher: Dispatcher = {
   readContext,
 
@@ -1851,6 +1964,10 @@ export const ContextOnlyDispatcher: Dispatcher = {
 
   unstable_isNewReconciler: enableNewReconciler,
 };
+if (enableCache) {
+  (ContextOnlyDispatcher: Dispatcher).getCacheForType = getCacheForType;
+  (ContextOnlyDispatcher: Dispatcher).useCacheRefresh = throwInvalidHookError;
+}
 
 const HooksDispatcherOnMount: Dispatcher = {
   readContext,
@@ -1872,6 +1989,10 @@ const HooksDispatcherOnMount: Dispatcher = {
 
   unstable_isNewReconciler: enableNewReconciler,
 };
+if (enableCache) {
+  (HooksDispatcherOnMount: Dispatcher).getCacheForType = getCacheForType;
+  (HooksDispatcherOnMount: Dispatcher).useCacheRefresh = mountRefresh;
+}
 
 const HooksDispatcherOnUpdate: Dispatcher = {
   readContext,
@@ -1893,6 +2014,10 @@ const HooksDispatcherOnUpdate: Dispatcher = {
 
   unstable_isNewReconciler: enableNewReconciler,
 };
+if (enableCache) {
+  (HooksDispatcherOnUpdate: Dispatcher).getCacheForType = getCacheForType;
+  (HooksDispatcherOnUpdate: Dispatcher).useCacheRefresh = updateRefresh;
+}
 
 const HooksDispatcherOnRerender: Dispatcher = {
   readContext,
@@ -1914,6 +2039,10 @@ const HooksDispatcherOnRerender: Dispatcher = {
 
   unstable_isNewReconciler: enableNewReconciler,
 };
+if (enableCache) {
+  (HooksDispatcherOnRerender: Dispatcher).getCacheForType = getCacheForType;
+  (HooksDispatcherOnRerender: Dispatcher).useCacheRefresh = updateRefresh;
+}
 
 let HooksDispatcherOnMountInDEV: Dispatcher | null = null;
 let HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher | null = null;
@@ -2068,6 +2197,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (HooksDispatcherOnMountInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (HooksDispatcherOnMountInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      mountHookTypesDev();
+      return mountRefresh();
+    };
+  }
 
   HooksDispatcherOnMountWithHookTypesInDEV = {
     readContext<T>(
@@ -2190,6 +2327,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return mountRefresh();
+    };
+  }
 
   HooksDispatcherOnUpdateInDEV = {
     readContext<T>(
@@ -2312,6 +2457,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (HooksDispatcherOnUpdateInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (HooksDispatcherOnUpdateInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return updateRefresh();
+    };
+  }
 
   HooksDispatcherOnRerenderInDEV = {
     readContext<T>(
@@ -2435,6 +2588,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (HooksDispatcherOnRerenderInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (HooksDispatcherOnRerenderInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return updateRefresh();
+    };
+  }
 
   InvalidNestedHooksDispatcherOnMountInDEV = {
     readContext<T>(
@@ -2572,6 +2733,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (InvalidNestedHooksDispatcherOnMountInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (InvalidNestedHooksDispatcherOnMountInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return mountRefresh();
+    };
+  }
 
   InvalidNestedHooksDispatcherOnUpdateInDEV = {
     readContext<T>(
@@ -2709,6 +2878,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (InvalidNestedHooksDispatcherOnUpdateInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (InvalidNestedHooksDispatcherOnUpdateInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return updateRefresh();
+    };
+  }
 
   InvalidNestedHooksDispatcherOnRerenderInDEV = {
     readContext<T>(
@@ -2847,4 +3024,12 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (InvalidNestedHooksDispatcherOnRerenderInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (InvalidNestedHooksDispatcherOnRerenderInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return updateRefresh();
+    };
+  }
 }

@@ -1,22 +1,27 @@
 'use strict';
 
-import {pipeToNodeWritable} from 'react-transport-dom-webpack/server';
-import * as React from 'react';
-import App from '../src/App.server';
+const {pipeToNodeWritable} = require('react-server-dom-webpack/writer');
+const {readFile} = require('fs');
+const {resolve} = require('path');
+const React = require('react');
 
 module.exports = function(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  pipeToNodeWritable(<App />, res, {
-    // TODO: Read from a map on the disk.
-    [require.resolve('../src/Counter.client.js')]: {
-      id: './src/Counter.client.js',
-      chunks: ['1'],
-      name: 'default',
-    },
-    [require.resolve('../src/ShowMore.client.js')]: {
-      id: './src/ShowMore.client.js',
-      chunks: ['2'],
-      name: 'default',
-    },
+  // const m = require('../src/App.server.js');
+  import('../src/App.server.js').then(m => {
+    const dist = process.env.NODE_ENV === 'development' ? 'dist' : 'build';
+    readFile(
+      resolve(__dirname, `../${dist}/react-client-manifest.json`),
+      'utf8',
+      (err, data) => {
+        if (err) {
+          throw err;
+        }
+
+        const App = m.default.default || m.default;
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        const moduleMap = JSON.parse(data);
+        pipeToNodeWritable(React.createElement(App), res, moduleMap);
+      }
+    );
   });
 };

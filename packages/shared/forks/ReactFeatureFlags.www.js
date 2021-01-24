@@ -28,6 +28,8 @@ export const {
   enableDebugTracing,
   enableDoubleInvokingEffects,
   enableUseRefAccessWarning,
+  disableNativeComponentFrames,
+  disableSchedulerTimeoutInWorkLoop,
 } = dynamicFeatureFlags;
 
 // On WWW, __EXPERIMENTAL__ is used for a new modern build.
@@ -58,6 +60,7 @@ export const enableSuspenseServerRenderer = true;
 export const enableSelectiveHydration = true;
 
 export const enableLazyElements = true;
+export const enableCache = true;
 
 export const disableJavaScriptURLs = true;
 

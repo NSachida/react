@@ -19,7 +19,7 @@ import type {
 import type {RendererInspectionConfig} from './ReactFiberHostConfig';
 import {FundamentalComponent} from './ReactWorkTags';
 import type {ReactNodeList} from 'shared/ReactTypes';
-import type {Lane, LanePriority} from './ReactFiberLane';
+import type {Lane, LanePriority} from './ReactFiberLane.new';
 import type {SuspenseState} from './ReactFiberSuspenseComponent.new';
 
 import {
@@ -82,7 +82,7 @@ import {
   higherPriorityLane,
   getCurrentUpdateLanePriority,
   setCurrentUpdateLanePriority,
-} from './ReactFiberLane';
+} from './ReactFiberLane.new';
 import {
   scheduleRefresh,
   scheduleRoot,
@@ -314,7 +314,7 @@ export function updateContainer(
     update.callback = callback;
   }
 
-  enqueueUpdate(current, update);
+  enqueueUpdate(current, update, lane);
   scheduleUpdateOnFiber(current, lane, eventTime);
 
   return lane;

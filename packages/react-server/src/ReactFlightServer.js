@@ -74,6 +74,7 @@ type Segment = {
 export type Request = {
   destination: Destination,
   bundlerConfig: BundlerConfig,
+  cache: Map<Function, mixed>,
   nextChunkId: number,
   pendingChunks: number,
   pingedSegments: Array<Segment>,
@@ -97,6 +98,7 @@ export function createRequest(
   const request = {
     destination,
     bundlerConfig,
+    cache: new Map(),
     nextChunkId: 0,
     pendingChunks: 0,
     pingedSegments: pingedSegments,
@@ -430,8 +432,17 @@ export function resolveModelToJSON(
     if (isModuleReference(value)) {
       const moduleReference: ModuleReference<any> = (value: any);
       const moduleKey: ModuleKey = getModuleKey(moduleReference);
-      const existingId = request.writtenModules.get(moduleKey);
+      const writtenModules = request.writtenModules;
+      const existingId = writtenModules.get(moduleKey);
       if (existingId !== undefined) {
+        if (parent[0] === REACT_ELEMENT_TYPE && key === '1') {
+          // If we're encoding the "type" of an element, we can refer
+          // to that by a lazy reference instead of directly since React
+          // knows how to deal with lazy values. This lets us suspend
+          // on this component rather than its parent until the code has
+          // loaded.
+          return serializeByRefID(existingId);
+        }
         return serializeByValueID(existingId);
       }
       try {
@@ -442,6 +453,7 @@ export function resolveModelToJSON(
         request.pendingChunks++;
         const moduleId = request.nextChunkId++;
         emitModuleChunk(request, moduleId, moduleMetaData);
+        writtenModules.set(moduleKey, moduleId);
         if (parent[0] === REACT_ELEMENT_TYPE && key === '1') {
           // If we're encoding the "type" of an element, we can refer
           // to that by a lazy reference instead of directly since React
@@ -652,7 +664,9 @@ function retrySegment(request: Request, segment: Segment): void {
 
 function performWork(request: Request): void {
   const prevDispatcher = ReactCurrentDispatcher.current;
+  const prevCache = currentCache;
   ReactCurrentDispatcher.current = Dispatcher;
+  currentCache = request.cache;
 
   const pingedSegments = request.pingedSegments;
   request.pingedSegments = [];
@@ -665,6 +679,7 @@ function performWork(request: Request): void {
   }
 
   ReactCurrentDispatcher.current = prevDispatcher;
+  currentCache = prevCache;
 }
 
 let reentrant = false;
@@ -743,6 +758,15 @@ function unsupportedHook(): void {
   invariant(false, 'This Hook is not supported in Server Components.');
 }
 
+function unsupportedRefresh(): void {
+  invariant(
+    currentCache,
+    'Refreshing the cache is not supported in Server Components.',
+  );
+}
+
+let currentCache: Map<Function, mixed> | null = null;
+
 const Dispatcher: DispatcherType = {
   useMemo<T>(nextCreate: () => T): T {
     return nextCreate();
@@ -757,6 +781,19 @@ const Dispatcher: DispatcherType = {
   useTransition(): [(callback: () => void) => void, boolean] {
     return [() => {}, false];
   },
+  getCacheForType<T>(resourceType: () => T): T {
+    invariant(
+      currentCache,
+      'Reading the cache is only supported while rendering.',
+    );
+    let entry: T | void = (currentCache.get(resourceType): any);
+    if (entry === undefined) {
+      entry = resourceType();
+      // TODO: Warn if undefined?
+      currentCache.set(resourceType, entry);
+    }
+    return entry;
+  },
   readContext: (unsupportedHook: any),
   useContext: (unsupportedHook: any),
   useReducer: (unsupportedHook: any),
@@ -767,4 +804,7 @@ const Dispatcher: DispatcherType = {
   useEffect: (unsupportedHook: any),
   useOpaqueIdentifier: (unsupportedHook: any),
   useMutableSource: (unsupportedHook: any),
+  useCacheRefresh(): <T>(?() => T, ?T) => void {
+    return unsupportedRefresh;
+  },
 };

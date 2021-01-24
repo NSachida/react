@@ -368,7 +368,7 @@ describe('Profiler', () => {
 
         renderer.update(<App />);
 
-        if (gate(flags => flags.new)) {
+        if (gate(flags => flags.enableUseJSStackToTrackPassiveDurations)) {
           // None of the Profiler's subtree was rendered because App bailed out before the Profiler.
           // So we expect onRender not to be called.
           expect(callback).not.toHaveBeenCalled();
@@ -698,6 +698,100 @@ describe('Profiler', () => {
         expect(updateCall[3]).toBe(15); // base time
         expect(updateCall[4]).toBe(28); // start time
         expect(updateCall[5]).toBe(43); // commit time
+      });
+
+      it('should clear nested-update flag when multiple cascading renders are scheduled', () => {
+        loadModules({
+          enableSchedulerTracing,
+          useNoopRenderer: true,
+        });
+
+        function Component() {
+          const [didMount, setDidMount] = React.useState(false);
+          const [didMountAndUpdate, setDidMountAndUpdate] = React.useState(
+            false,
+          );
+
+          React.useLayoutEffect(() => {
+            setDidMount(true);
+          }, []);
+
+          React.useEffect(() => {
+            if (didMount && !didMountAndUpdate) {
+              setDidMountAndUpdate(true);
+            }
+          }, [didMount, didMountAndUpdate]);
+
+          Scheduler.unstable_yieldValue(`${didMount}:${didMountAndUpdate}`);
+
+          return null;
+        }
+
+        const onRender = jest.fn();
+
+        ReactNoop.act(() => {
+          ReactNoop.render(
+            <React.Profiler id="root" onRender={onRender}>
+              <Component />
+            </React.Profiler>,
+          );
+        });
+        expect(Scheduler).toHaveYielded([
+          'false:false',
+          'true:false',
+          'true:true',
+        ]);
+
+        expect(onRender).toHaveBeenCalledTimes(3);
+        expect(onRender.mock.calls[0][1]).toBe('mount');
+        expect(onRender.mock.calls[1][1]).toBe('nested-update');
+        expect(onRender.mock.calls[2][1]).toBe('update');
+      });
+
+      it('is properly distinguish updates and nested-updates when there is more than sync remaining work', () => {
+        loadModules({
+          enableSchedulerTracing,
+          useNoopRenderer: true,
+        });
+
+        function Component() {
+          const [didMount, setDidMount] = React.useState(false);
+
+          React.useLayoutEffect(() => {
+            setDidMount(true);
+          }, []);
+          Scheduler.unstable_yieldValue(didMount);
+          return didMount;
+        }
+
+        const onRender = jest.fn();
+
+        // Schedule low-priority work.
+        Scheduler.unstable_runWithPriority(
+          Scheduler.unstable_LowPriority,
+          () => {
+            ReactNoop.render(
+              <React.Profiler id="root" onRender={onRender}>
+                <Component />
+              </React.Profiler>,
+            );
+          },
+        );
+
+        // Flush sync work with a nested upate
+        ReactNoop.flushSync(() => {
+          ReactNoop.render(
+            <React.Profiler id="root" onRender={onRender}>
+              <Component />
+            </React.Profiler>,
+          );
+        });
+        expect(Scheduler).toHaveYielded([false, true]);
+
+        // Verify that the nested update inside of the sync work is appropriately tagged.
+        expect(onRender).toHaveBeenCalledTimes(2);
+        expect(onRender.mock.calls[0][1]).toBe('mount');
+        expect(onRender.mock.calls[1][1]).toBe('nested-update');
       });
 
       describe('with regard to interruptions', () => {
@@ -2534,11 +2628,48 @@ describe('Profiler', () => {
 
         expect(Scheduler).toHaveYielded(['Component:false', 'Component:true']);
         expect(onNestedUpdateScheduled).toHaveBeenCalledTimes(1);
+        expect(onNestedUpdateScheduled.mock.calls[0][0]).toBe('test');
         if (ReactFeatureFlags.enableSchedulerTracing) {
-          expect(onNestedUpdateScheduled.mock.calls[0][0]).toMatchInteractions([
+          expect(onNestedUpdateScheduled.mock.calls[0][1]).toMatchInteractions([
             interactionCreation,
           ]);
         }
+      });
+
+      it('is called when a function component schedules a batched update during a layout effect', () => {
+        function Component() {
+          const [didMount, setDidMount] = React.useState(false);
+          React.useLayoutEffect(() => {
+            ReactNoop.batchedUpdates(() => {
+              setDidMount(true);
+            });
+          }, []);
+          Scheduler.unstable_yieldValue(`Component:${didMount}`);
+          return didMount;
+        }
+
+        const onNestedUpdateScheduled = jest.fn();
+        const onRender = jest.fn();
+
+        ReactNoop.render(
+          <React.Profiler
+            id="root"
+            onNestedUpdateScheduled={onNestedUpdateScheduled}
+            onRender={onRender}>
+            <Component />
+          </React.Profiler>,
+        );
+        expect(Scheduler).toFlushAndYield([
+          'Component:false',
+          'Component:true',
+        ]);
+
+        expect(onRender).toHaveBeenCalledTimes(2);
+        expect(onRender.mock.calls[0][1]).toBe('mount');
+        expect(onRender.mock.calls[1][1]).toBe('nested-update');
+
+        expect(onNestedUpdateScheduled).toHaveBeenCalledTimes(1);
+        expect(onNestedUpdateScheduled.mock.calls[0][0]).toBe('root');
       });
 
       it('bubbles up and calls all ancestor Profilers', () => {
@@ -2576,7 +2707,9 @@ describe('Profiler', () => {
 
         expect(Scheduler).toHaveYielded(['Component:false', 'Component:true']);
         expect(onNestedUpdateScheduledOne).toHaveBeenCalledTimes(1);
+        expect(onNestedUpdateScheduledOne.mock.calls[0][0]).toBe('one');
         expect(onNestedUpdateScheduledTwo).toHaveBeenCalledTimes(1);
+        expect(onNestedUpdateScheduledTwo.mock.calls[0][0]).toBe('two');
         expect(onNestedUpdateScheduledThree).not.toHaveBeenCalled();
       });
 
@@ -2768,8 +2901,9 @@ describe('Profiler', () => {
           'Component:true:false',
         ]);
         expect(onNestedUpdateScheduled).toHaveBeenCalledTimes(1);
+        expect(onNestedUpdateScheduled.mock.calls[0][0]).toBe('test');
         if (ReactFeatureFlags.enableSchedulerTracing) {
-          expect(onNestedUpdateScheduled.mock.calls[0][0]).toMatchInteractions([
+          expect(onNestedUpdateScheduled.mock.calls[0][1]).toMatchInteractions([
             interactionCreation,
           ]);
         }
@@ -2801,8 +2935,9 @@ describe('Profiler', () => {
           'Component:true:true',
         ]);
         expect(onNestedUpdateScheduled).toHaveBeenCalledTimes(2);
+        expect(onNestedUpdateScheduled.mock.calls[1][0]).toBe('test');
         if (ReactFeatureFlags.enableSchedulerTracing) {
-          expect(onNestedUpdateScheduled.mock.calls[1][0]).toMatchInteractions([
+          expect(onNestedUpdateScheduled.mock.calls[1][1]).toMatchInteractions([
             interactionUpdate,
           ]);
         }
@@ -2849,8 +2984,9 @@ describe('Profiler', () => {
 
         expect(Scheduler).toHaveYielded(['Component:false', 'Component:true']);
         expect(onNestedUpdateScheduled).toHaveBeenCalledTimes(1);
+        expect(onNestedUpdateScheduled.mock.calls[0][0]).toBe('test');
         if (ReactFeatureFlags.enableSchedulerTracing) {
-          expect(onNestedUpdateScheduled.mock.calls[0][0]).toMatchInteractions([
+          expect(onNestedUpdateScheduled.mock.calls[0][1]).toMatchInteractions([
             interactionCreation,
           ]);
         }
@@ -2920,8 +3056,9 @@ describe('Profiler', () => {
           'Component:true:true',
         ]);
         expect(onNestedUpdateScheduled).toHaveBeenCalledTimes(1);
+        expect(onNestedUpdateScheduled.mock.calls[0][0]).toBe('test');
         if (ReactFeatureFlags.enableSchedulerTracing) {
-          expect(onNestedUpdateScheduled.mock.calls[0][0]).toMatchInteractions([
+          expect(onNestedUpdateScheduled.mock.calls[0][1]).toMatchInteractions([
             interactionCreation,
           ]);
         }
@@ -2961,6 +3098,8 @@ describe('Profiler', () => {
         expect(Scheduler).toHaveYielded(['Component:true']);
         expect(onNestedUpdateScheduled).not.toHaveBeenCalled();
       });
+
+      // TODO Add hydration tests to ensure we don't have false positives called.
     });
   });
 
@@ -4244,7 +4383,7 @@ describe('Profiler', () => {
         // because the resolved suspended subtree doesn't contain any passive effects.
         // If <AsyncComponentWithCascadingWork> or its decendents had a passive effect,
         // onPostCommit would be called again.
-        if (gate(flags => flags.new)) {
+        if (gate(flags => flags.enableUseJSStackToTrackPassiveDurations)) {
           expect(Scheduler).toFlushAndYield([]);
         } else {
           expect(Scheduler).toFlushAndYield(['onPostCommit']);
@@ -4735,7 +4874,6 @@ describe('Profiler', () => {
       });
 
       if (__DEV__) {
-        // @gate new
         it('double invoking does not disconnect wrapped async work', () => {
           ReactFeatureFlags.enableDoubleInvokingEffects = true;
 

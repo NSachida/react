@@ -8,10 +8,11 @@
  */
 
 import type {Fiber} from './ReactInternalTypes';
-import type {Lanes, Lane} from './ReactFiberLane';
+import type {Lanes, Lane} from './ReactFiberLane.new';
 import type {
   ReactFundamentalComponentInstance,
   ReactScopeInstance,
+  ReactContext,
 } from 'shared/ReactTypes';
 import type {FiberRoot} from './ReactInternalTypes';
 import type {
@@ -27,6 +28,7 @@ import type {
 } from './ReactFiberSuspenseComponent.new';
 import type {SuspenseContext} from './ReactFiberSuspenseContext.new';
 import type {OffscreenState} from './ReactFiberOffscreenComponent';
+import type {Cache, SpawnedCachePool} from './ReactFiberCacheComponent.new';
 
 import {resetWorkInProgressVersions as resetMutableSourceWorkInProgressVersions} from './ReactMutableSource.new';
 
@@ -56,6 +58,7 @@ import {
   ScopeComponent,
   OffscreenComponent,
   LegacyHiddenComponent,
+  CacheComponent,
 } from './ReactWorkTags';
 import {
   NoMode,
@@ -66,18 +69,12 @@ import {
 import {
   Ref,
   Update,
-  Callback,
-  Passive,
-  Deletion,
   NoFlags,
   DidCapture,
   Snapshot,
-  Visibility,
-  MutationMask,
-  LayoutMask,
-  PassiveMask,
+  ChildDeletion,
   StaticMask,
-  PerformedWork,
+  MutationMask,
 } from './ReactFiberFlags';
 import invariant from 'shared/invariant';
 
@@ -140,6 +137,7 @@ import {
   enableFundamentalAPI,
   enableScopeAPI,
   enableProfilerTimer,
+  enableCache,
 } from 'shared/ReactFeatureFlags';
 import {
   markSpawnedWork,
@@ -157,10 +155,15 @@ import {
   NoLanes,
   includesSomeLane,
   mergeLanes,
-} from './ReactFiberLane';
+} from './ReactFiberLane.new';
 import {resetChildFibers} from './ReactChildFiber.new';
 import {createScopeInstance} from './ReactFiberScope.new';
 import {transferActualDuration} from './ReactProfilerTimer.new';
+import {
+  popCacheProvider,
+  popRootCachePool,
+  popCachePool,
+} from './ReactFiberCacheComponent.new';
 
 function markUpdate(workInProgress: Fiber) {
   // Tag the fiber with an update effect. This turns a Placement into
@@ -178,12 +181,18 @@ function hadNoMutationsEffects(current: null | Fiber, completedWork: Fiber) {
     return true;
   }
 
+  if ((completedWork.flags & ChildDeletion) !== NoFlags) {
+    return false;
+  }
+
+  // TODO: If we move the `hadNoMutationsEffects` call after `bubbleProperties`
+  // then we only have to check the `completedWork.subtreeFlags`.
   let child = completedWork.child;
   while (child !== null) {
-    if ((child.flags & MutationMask) !== NoFlags) {
-      return false;
-    }
-    if ((child.subtreeFlags & MutationMask) !== NoFlags) {
+    if (
+      (child.flags & MutationMask) !== NoFlags ||
+      (child.subtreeFlags & MutationMask) !== NoFlags
+    ) {
       return false;
     }
     child = child.sibling;
@@ -821,6 +830,7 @@ function completeWork(
     case ForwardRef:
     case Fragment:
     case Mode:
+    case Profiler:
     case ContextConsumer:
     case MemoComponent:
       bubbleProperties(workInProgress);
@@ -834,10 +844,16 @@ function completeWork(
       return null;
     }
     case HostRoot: {
+      const fiberRoot = (workInProgress.stateNode: FiberRoot);
+      if (enableCache) {
+        popRootCachePool(fiberRoot, renderLanes);
+
+        const cache: Cache = workInProgress.memoizedState.cache;
+        popCacheProvider(workInProgress, cache);
+      }
       popHostContainer(workInProgress);
       popTopLevelLegacyContextObject(workInProgress);
       resetMutableSourceWorkInProgressVersions();
-      const fiberRoot = (workInProgress.stateNode: FiberRoot);
       if (fiberRoot.pendingContext) {
         fiberRoot.context = fiberRoot.pendingContext;
         fiberRoot.pendingContext = null;
@@ -982,57 +998,6 @@ function completeWork(
       bubbleProperties(workInProgress);
       return null;
     }
-    case Profiler: {
-      const didBailout = bubbleProperties(workInProgress);
-      if (!didBailout) {
-        // Use subtreeFlags to determine which commit callbacks should fire.
-        // TODO: Move this logic to the commit phase, since we already check if
-        // a fiber's subtree contains effects. Refactor the commit phase's
-        // depth-first traversal so that we can put work tag-specific logic
-        // before or after committing a subtree's effects.
-        const OnRenderFlag = Update;
-        const OnCommitFlag = Callback;
-        const OnPostCommitFlag = Passive;
-        const subtreeFlags = workInProgress.subtreeFlags;
-        const flags = workInProgress.flags;
-        let newFlags = flags;
-
-        // Call onRender any time this fiber or its subtree are worked on.
-        if (
-          (flags & PerformedWork) !== NoFlags ||
-          (subtreeFlags & PerformedWork) !== NoFlags
-        ) {
-          newFlags |= OnRenderFlag;
-        }
-
-        // Call onCommit only if the subtree contains layout work, or if it
-        // contains deletions, since those might result in unmount work, which
-        // we include in the same measure.
-        // TODO: Can optimize by using a static flag to track whether a tree
-        // contains layout effects, like we do for passive effects.
-        if (
-          (flags & (LayoutMask | Deletion)) !== NoFlags ||
-          (subtreeFlags & (LayoutMask | Deletion)) !== NoFlags
-        ) {
-          newFlags |= OnCommitFlag;
-        }
-
-        // Call onPostCommit only if the subtree contains passive work.
-        // Don't have to check for deletions, because Deletion is already
-        // a passive flag.
-        if (
-          (flags & PassiveMask) !== NoFlags ||
-          (subtreeFlags & PassiveMask) !== NoFlags
-        ) {
-          newFlags |= OnPostCommitFlag;
-        }
-        workInProgress.flags = newFlags;
-      } else {
-        // This fiber and its subtree bailed out, so don't fire any callbacks.
-      }
-
-      return null;
-    }
     case SuspenseComponent: {
       popSuspenseContext(workInProgress);
       const nextState: null | SuspenseState = workInProgress.memoizedState;
@@ -1163,8 +1128,8 @@ function completeWork(
         // TODO: Only schedule updates if not prevDidTimeout.
         if (nextDidTimeout) {
           // If this boundary just timed out, schedule an effect to attach a
-          // retry listener to the promise.
-          // TODO: Move to passive phase
+          // retry listener to the promise. This flag is also used to hide the
+          // primary children.
           workInProgress.flags |= Update;
         }
       }
@@ -1176,7 +1141,7 @@ function completeWork(
           // primary children. In mutation mode, we also need the flag to
           // *unhide* children that were previously hidden, so check if this
           // is currently timed out, too.
-          workInProgress.flags |= Update | Visibility;
+          workInProgress.flags |= Update;
         }
       }
       if (
@@ -1185,7 +1150,6 @@ function completeWork(
         workInProgress.memoizedProps.suspenseCallback != null
       ) {
         // Always notify the callback
-        // TODO: Move to passive phase
         workInProgress.flags |= Update;
       }
       bubbleProperties(workInProgress);
@@ -1213,7 +1177,8 @@ function completeWork(
       return null;
     case ContextProvider:
       // Pop provider fiber
-      popProvider(workInProgress);
+      const context: ReactContext<any> = workInProgress.type._context;
+      popProvider(context, workInProgress);
       bubbleProperties(workInProgress);
       return null;
     case IncompleteClassComponent: {
@@ -1288,6 +1253,7 @@ function completeWork(
 
                 // Rerender the whole list, but this time, we'll force fallbacks
                 // to stay in place.
+                // Reset the effect flags before doing the second pass since that's now invalid.
                 // Reset the child fibers to their original state.
                 workInProgress.subtreeFlags = NoFlags;
                 resetChildFibers(workInProgress, renderLanes);
@@ -1379,10 +1345,13 @@ function completeWork(
             cutOffTailIfNeeded(renderState, false);
 
             // Since nothing actually suspended, there will nothing to ping this
-            // to get it started back up to attempt the next item. If we can show
-            // them, then they really have the same priority as this render.
-            // So we'll pick it back up the very next render pass once we've had
-            // an opportunity to yield for paint.
+            // to get it started back up to attempt the next item. While in terms
+            // of priority this work has the same priority as this current render,
+            // it's not part of the same transition once the transition has
+            // committed. If it's sync, we still want to yield so that it can be
+            // painted. Conceptually, this is really the same as pinging.
+            // We can use any RetryLane even if it's the one currently rendering
+            // since we're leaving it behind on this node.
             workInProgress.lanes = SomeRetryLane;
             if (enableSchedulerTracing) {
               markSpawnedWork(SomeRetryLane);
@@ -1521,13 +1490,12 @@ function completeWork(
 
       if (current !== null) {
         const prevState: OffscreenState | null = current.memoizedState;
-
         const prevIsHidden = prevState !== null;
         if (
           prevIsHidden !== nextIsHidden &&
           newProps.mode !== 'unstable-defer-without-hiding'
         ) {
-          workInProgress.flags |= Update | Visibility;
+          workInProgress.flags |= Update;
         }
       }
 
@@ -1540,7 +1508,22 @@ function completeWork(
         bubbleProperties(workInProgress);
       }
 
+      if (enableCache) {
+        const spawnedCachePool: SpawnedCachePool | null = (workInProgress.updateQueue: any);
+        if (spawnedCachePool !== null) {
+          popCachePool(workInProgress);
+        }
+      }
+
       return null;
+    }
+    case CacheComponent: {
+      if (enableCache) {
+        const cache: Cache = workInProgress.memoizedState.cache;
+        popCacheProvider(workInProgress, cache);
+        bubbleProperties(workInProgress);
+        return null;
+      }
     }
   }
   invariant(

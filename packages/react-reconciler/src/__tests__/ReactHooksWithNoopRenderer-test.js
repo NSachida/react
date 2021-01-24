@@ -249,13 +249,18 @@ describe('ReactHooksWithNoopRenderer', () => {
   }
 
   it('throws when called outside the render phase', () => {
-    expect(() => useState(0)).toThrow(
+    expect(() => {
+      expect(() => useState(0)).toThrow(
+        "Cannot read property 'useState' of null",
+      );
+    }).toErrorDev(
       'Invalid hook call. Hooks can only be called inside of the body of a function component. This could happen for' +
         ' one of the following reasons:\n' +
         '1. You might have mismatching versions of React and the renderer (such as React DOM)\n' +
         '2. You might be breaking the Rules of Hooks\n' +
         '3. You might have more than one copy of React in the same app\n' +
         'See https://reactjs.org/link/invalid-hook-call for tips about how to debug and fix this problem.',
+      {withoutStack: true},
     );
   });
 
@@ -3369,5 +3374,107 @@ describe('ReactHooksWithNoopRenderer', () => {
       root.render(null);
     });
     expect(Scheduler).toHaveYielded(['Unmount layout B', 'Unmount passive B']);
+  });
+
+  it('regression: deleting a tree and unmounting its effects after a reorder', async () => {
+    const root = ReactNoop.createRoot();
+
+    function Child({label}) {
+      useEffect(() => {
+        Scheduler.unstable_yieldValue('Mount ' + label);
+        return () => {
+          Scheduler.unstable_yieldValue('Unmount ' + label);
+        };
+      }, [label]);
+      return label;
+    }
+
+    await act(async () => {
+      root.render(
+        <>
+          <Child key="A" label="A" />
+          <Child key="B" label="B" />
+        </>,
+      );
+    });
+    expect(Scheduler).toHaveYielded(['Mount A', 'Mount B']);
+
+    await act(async () => {
+      root.render(
+        <>
+          <Child key="B" label="B" />
+          <Child key="A" label="A" />
+        </>,
+      );
+    });
+    expect(Scheduler).toHaveYielded([]);
+
+    await act(async () => {
+      root.render(null);
+    });
+
+    expect(Scheduler).toHaveYielded([
+      'Unmount B',
+      // In the regression, the reorder would cause Child A to "forget" that it
+      // contains passive effects. Then when we deleted the tree, A's unmount
+      // effect would not fire.
+      'Unmount A',
+    ]);
+  });
+
+  // @gate experimental
+  it('regression: SuspenseList causes unmounts to be dropped on deletion', async () => {
+    const SuspenseList = React.unstable_SuspenseList;
+
+    function Row({label}) {
+      useEffect(() => {
+        Scheduler.unstable_yieldValue('Mount ' + label);
+        return () => {
+          Scheduler.unstable_yieldValue('Unmount ' + label);
+        };
+      }, [label]);
+      return (
+        <Suspense fallback="Loading...">
+          <AsyncText text={label} />
+        </Suspense>
+      );
+    }
+
+    function App() {
+      return (
+        <SuspenseList revealOrder="together">
+          <Row label="A" />
+          <Row label="B" />
+        </SuspenseList>
+      );
+    }
+
+    const root = ReactNoop.createRoot();
+    await ReactNoop.act(async () => {
+      root.render(<App />);
+    });
+    expect(Scheduler).toHaveYielded([
+      'Suspend! [A]',
+      'Suspend! [B]',
+      'Mount A',
+      'Mount B',
+    ]);
+
+    await ReactNoop.act(async () => {
+      await resolveText('A');
+    });
+    expect(Scheduler).toHaveYielded([
+      'Promise resolved [A]',
+      'A',
+      'Suspend! [B]',
+    ]);
+
+    await ReactNoop.act(async () => {
+      root.render(null);
+    });
+    // In the regression, SuspenseList would cause the children to "forget" that
+    // it contains passive effects. Then when we deleted the tree, these unmount
+    // effects would not fire.
+    expect(Scheduler).toHaveYielded(['Unmount A', 'Unmount B']);
   });
 });
